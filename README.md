@@ -1,81 +1,62 @@
-# Round2-OpHackers
-Repository for team OpHackers for Round 2
-# ORCA — Orbital Rescue and Collision Avoidance
+# ORCA backend
 
-Multi-objective trajectory optimizer for satellite rendezvous/rescue planning.
-NSGA-II searches over departure timing, phasing, and thruster impulse split to
-find a Pareto front trading off ΔV, time-to-rendezvous, collision risk, and
-capture probability — subject to hard constraints (ΔV budget, thruster
-impulse caps, Lambert convergence).
+Optional Python service that gives ORCA real orbital data, server-side
+NSGA-II optimization, and run persistence. **The frontend runs fully without
+it** — if `VITE_ORCA_BACKEND_URL` is unset or `/health` fails, the app
+silently uses its client-only engine. Demo safety is non-negotiable.
 
 ## Stack
+- **FastAPI** + **uvicorn** — async API + WebSocket streaming
+- **pymoo** — NSGA-II (non-dominated sort, crowding distance, SBX, polynomial
+  mutation, elitist survival)
+- **numpy** — RK4/J2 propagation + Monte Carlo uncertainty (numerically
+  identical to the frontend so backend-on/off numbers match)
+- **sgp4** (python-sgp4) — TLE propagation for the Catalog
+- **poliastro** + **astropy** — optional ground-truth validation (not on the
+  hot path; server runs without them)
+- **SQLModel/SQLite** — zero-setup file persistence for "pin this run"
+- **httpx** — Celestrak TLE fetch with on-disk caching
 
-- **Frontend**: React + TypeScript + Vite, Three.js for the 3D globe/orbit
-  view, Recharts for the convergence/Pareto charts.
-- **Backend**: FastAPI + pymoo (NSGA-II) + numpy, SGP4 for real catalog
-  satellites, live TLE data from Celestrak.
-- **Physics**: RK4 + J2-perturbed two-body propagation and a universal-variable
-  Lambert solver, implemented independently in Python (`backend/engine/`) and
-  TypeScript (`src/simulation/orbitalMechanics.ts`) and kept numerically
-  synced via an automated parity check (see below).
-
-## Running locally
-
-Backend:
+## Run
 ```bash
-cd backend
+python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-./run.sh          # or: uvicorn main:app --reload
+./run.sh          # uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Frontend:
-```bash
-npm install
-npm run dev
-```
+## Environment
+| Variable | Default | Effect |
+|---|---|---|
+| `VITE_ORCA_BACKEND_URL` *(frontend)* | unset | Base URL of this service. Unset → client-only mode. |
+| `ORCA_HOST` / `ORCA_PORT` | `0.0.0.0` / `8000` | Bind address for `run.sh` |
+| `ORCA_DB_URL` | `sqlite:///orca_runs.db` | SQLite path |
 
-By default CORS only allows `http://localhost:5173`. To allow a different
-frontend origin, set `ORCA_FRONTEND_ORIGIN` (comma-separated for multiple
-origins) before starting the backend.
+## API contract
+- `GET /health` → `{ status, engine_version, backend }`
+- `GET /catalog/satellites?group=…&limit=…` → `CatalogSatellite[]` (SGP4 positions, cached, seed-CSV fallback)
+- `GET /catalog/satellites/{noradId}` → full detail + live position
+- `POST /optimize/run` → `{ runId, websocketUrl }`
+- `WS /optimize/stream/{runId}` → per-generation `{ generation, best, mean, paretoFront, final }`
+- `POST /optimize/sweep` → `{ sweepId, websocketUrl }`  ·  `WS /optimize/sweep/{sweepId}`
+- `GET /runs`, `GET /runs/{id}`, `POST /runs/{id}/pin`, `GET /runs/pinned`
 
-## Health check
+## Correctness guarantees
+- **One propagation path** — waypoints and objective scoring both come from
+  `engine/propagation.propagate()`. Catalog uses SGP4 separately.
+- **ΔV** is `|v_transfer − v_current|`, a vector magnitude, always ≥ 0, km/s.
+- **ETA** is the Lambert time-of-flight, always ≥ 0.
+- **Fuel Remaining** is `(current / capacity) × 100`, clamped 0–100, tied to ΔV
+  via the rocket equation.
+- **Hard constraints filter** — over-budget / over-thruster-cap candidates
+  are flagged `feasible:false` and excluded from the Pareto set.
+- **Elitism** — pymoo's NSGA-II survival guarantees per-generation best is
+  monotonically non-worsening.
+- Every response carries a `real_vs_simulated: { orbits, distressEvent }`
+  disclosure block.
 
-```bash
-curl http://localhost:8000/health
-```
-Returns `{"status": "online", "engine_version": "1.0.0", "backend": true}`.
-Useful as a liveness probe / smoke test after deploy.
-
-## Tests
-
-Backend (pytest — lambert solver, hard constraints, propagator, NSGA-II smoke
-tests):
-```bash
-cd backend
-pytest -q
-```
-
-Frontend (vitest — TS orbital mechanics, optimizer helpers, and a physics
-parity check against the Python engine):
-```bash
-npm test
-```
-
-Type-check:
-```bash
-npx tsc --noEmit
-```
-
-## CI
-
-`.github/workflows/ci.yml` runs on every push/PR: backend pytest, frontend
-vitest + `tsc --noEmit`, and a physics parity check that fails the build if
-the Python and TypeScript propagators drift apart (regenerate
-`backend/scripts/parity_fixture.json` via
-`python backend/scripts/parity_check.py` if a change is intentional).
-
-## Known limitations (by design, for now)
-
-- Run/sweep state (`_LIVE`, `_RUNS` in `backend/routers/optimize.py`) is kept
-  in-process — fine for a single uvicorn worker / demo, not for multi-worker
-  deployment. Would move to Redis for that.
+## Demo-safe fallback
+Catalog: live fetch → on-disk cache → bundled `data/seed_satellites.csv`.
+Optimizer: if the backend is unreachable, the frontend never blocks — it uses
+the client engine. Refresh the seed CSV TLE lines from Celestrak before
+judging for fresh epochs:
+`https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle`
